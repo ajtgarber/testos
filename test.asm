@@ -1,20 +1,11 @@
-; This "bootloader" simply loads its second section and executes it
-; it runs soley in real mode and uses the BIOS as a crutch
-
-; references being Wikipedia and the all mighty Google
-
-; to assemble this file (using NASM) use:
-; nasm -f bin test.asm -o test.bin
-; to generate a floppy emulated iso file use this command (assuming you keep test.asm as the name)
-;  mkisofs -U -D -floppy-boot -no-emul-boot -boot-load-size 4 -b test.bin -c boot.catalog -hide test.bin -hide boot.catalog -V "TestOS" -iso-level 3 -L -o test.iso . 
-; if you don't specify the -no-emul-boot you may have to pad the test.bin with zeroes to make it (this is a guess
-; 1.44 MB in size).
+; This is currently an attempt to play with OS development in real
+; mode (yes I'm aware abusing the BIOS and real mode in general
+; is frowned upon). Right now it just plays with multitasking
 
 [BITS 16]			; The code is running in 16 bit real mode
 [ORG 0x7C00]			; BIOS loads us here
 
 bootload_main:
-	mov [DeviceLoadedFrom], dl	; BIOS places what drive we're loaded from into dl, store this for later use
 	; setup segments
 	mov ax, 0
 	mov ds, ax
@@ -23,10 +14,15 @@ bootload_main:
 	mov fs, ax
 	mov gs, ax
 	
-	; should be fairly self-explanitory (print "Hello World!")
+	mov [DeviceLoadedFrom], dl	; BIOS places what drive we're loaded from into dl, store this for later use
+
+	; should be fairly self-explanatory (print "Hello World!")
 	mov si, HelloWorld
 	call printk
 	
+	; Determine available low memory
+	call showMem
+
 	; tell the user we're loading a sector
 	mov si, LoadingSector
 	call printk
@@ -34,7 +30,7 @@ bootload_main:
 	; actually load the sector
 	call loadSector
 
-	; jmp to it (execute the code there, careful on doing this on non-code areas)
+	; jmp to it (execute the code there)
 	jmp 0x7E00
 
 	; just in case something goes horribly wrong and we're still here say this
@@ -68,16 +64,109 @@ loadSector:
 	mov dh, 0    			; head (0 based)
 	mov dl, [DeviceLoadedFrom] 	; read from the device we we're loaded from
 	mov bx, 0x7E00			; save the sector at 0x7E00, the next 512 bytes in RAM next to us
-	int 0x13			; BIOS Drive Interupt
-	cmp ah, 0x00			; Check if we were successful, if 0 we were (some emulators screw this up)
-	je .successful
+	int 0x13
+	cmp al, 1			; BIOS Drive Interupt
+	je .successful			; Check if we were successful, if 0 we were (some emulators screw this up)
+	call dump_regs
 	mov si, LoadSectorUnsuccessful
 	call printk
-	ret
+
+	mov ah, 0x01
+	mov al, [DeviceLoadedFrom]
+	int 0x13
+
+	call dump_regs
+	cli
+	hlt
 .successful
 	mov si, LoadSectorSuccessful
 	call printk
 	ret
+
+showMem:
+	pusha
+	pushf
+
+	mov si, showMemPrefix
+	call printk
+
+	clc
+	int 0x12
+	jc .error
+	call print_hex
+	
+	mov si, showMemSuffix
+	call printk	
+
+	jmp .end
+
+.error
+	mov si, showMemErr
+	call printk
+	jmp .end
+
+.end
+	popf
+	popa
+	ret
+
+showMemErr db 'BIOS does not support int 0x12', 13, 10, 0
+showMemPrefix db '0x', 0
+showMemSuffix db ' KB are available', 13, 10, 0
+	
+; Input comes in from ax
+print_hex: ; Mostly taken from osdev wiki
+	pusha
+	pushf ; because I'm being lazy for now, this function clobbers flags
+	      ; and I haven't completed the simple task of digging through
+	      ; to figure out which ones, just going to save what we have
+	      ; and restore back to it
+
+	push ax	; store this for later
+	mov [.temp], ah
+	mov al, ah
+	shr al, 4
+	cmp al, 10
+	sbb al, 0x69
+	das
+
+	mov ah, 0x0E
+	int 0x10
+
+	mov al, [.temp]
+	ror al, 4
+	shr al, 4
+	cmp al, 10
+	sbb al, 0x69
+	das
+
+	mov ah, 0x0E 
+	int 0x10
+
+	pop ax ; begin work on the upper half of ax
+	mov [.temp], al
+	shr al, 4
+	cmp al, 10
+	sbb al, 0x69
+	das
+
+	mov ah, 0x0E
+	int 0x10
+
+	mov al, [.temp]
+	ror al, 4
+	shr al, 4
+	cmp al, 10
+	sbb al, 0x69
+	das
+
+	mov ah, 0x0E
+	int 0x10
+
+	popf
+	popa
+	ret
+.temp db 0
 
 HelloWorld db 'Hello, World!', 13, 10, 0
 LoadingSector db 'Loading Second Sector...', 13, 10, 0
@@ -95,8 +184,168 @@ dw 0xAA55			; Boot signature
 ; print out a test string to make sure this was loaded
 mov si, testing
 call printk
+jmp second_sector
+
+first_task:
+	mov si, task1_msg
+	call printk
+
+	int 0x80
+	
+	hlt
+	jmp first_task
+	
 cli
 hlt
+task1_msg db 'A', 0
 
-testing db 'Testing Second Sector! Now Halting! YAY!!!!', 13, 10, 0
+task2_msg db 'B', 0
+second_task:
+	mov si, task2_msg
+	call printk
+
+	int 0x80
+
+	hlt
+	jmp second_task
+cli
+hlt
+ts_msg db 'C', 0
+
+second_sector:
+	pusha
+
+	mov [task1_sp], sp
+	; setup second 'thread' information
+	mov [task2_sp],  word 0x600 ; arbitrary stack selection
+	mov [curr_task], word 0x0
+
+	; Pretty sure there's a cleaner obvious way
+	; to do this
+	; ... don't judge me
+	mov sp, [task2_sp]
+	pushf
+	push word 0x0 ; cs
+	push word second_task ;ip
+	pusha
+	mov [task2_sp], sp
+	mov sp, [task1_sp]
+
+	cli ; hook software interrupt 0x80
+	mov [0x200], word handle_task
+	mov [0x202], word 0x0
+	sti
+	jmp first_task
+
+handle_task:	
+	pusha ; push everything from the calling task
+
+	mov ax, [curr_task]
+	inc ax
+	cmp ax, 2
+	jl .nowrap
+	xor ax, ax
+.nowrap	
+	mov [curr_task], ax	
+	cmp ax, 1
+	je .second_task
+	mov [task2_sp], word sp
+	mov sp, [task1_sp]
+	jmp .task
+.second_task
+	mov [task1_sp], word sp
+	mov sp, [task2_sp]
+.task
+	
+	popa
+	iret
+; rudimentary task switching information
+curr_task dw 0
+task1_sp  dw 0
+task2_sp  dw 0
+
+strcmp:
+	.loop
+		mov al, [si] ; grab from si
+		mov bl, [di]
+		cmp al, bl
+		jne .notequal
+
+		cmp al, 0
+		je .done
+
+		inc di
+		inc si
+		jmp .loop
+
+	.notequal
+		clc
+		ret
+
+	.done
+		stc
+		ret
+
+dump_regs:
+	pusha
+	pusha
+
+	mov si, .description
+	call printk
+	pop ax
+	call print_hex
+	mov si, .endl
+	call printk
+
+	pop ax
+	call print_hex
+	mov si, .endl
+	call printk
+
+	pop ax
+	call print_hex
+	mov si, .endl
+	call printk	
+
+	pop ax
+	call print_hex
+	mov si, .endl
+	call printk
+
+	pop ax
+	call print_hex
+	mov si, .endl
+	call printk
+
+	pop ax
+	call print_hex
+	mov si, .endl
+	call printk
+
+	pop ax
+	call print_hex
+	mov si, .endl
+	call printk	
+
+	pop ax
+	call print_hex
+	mov si, .endl
+	call printk
+
+	popa
+	ret
+.description db 'DI, SI, BP, SP, BX, DX, CX, AX', 13, 10, 0
+.endl db 13, 10, 0
+
+
+testing db 'Testing Second Sector!', 13, 10, 0
+prompt db '> ', 0
+cmd_help db 'help', 0
+cmd_dump db 'dump', 0
+cmd_mem  db 'mem', 0
+helpstr db 'What help?', 13, 10, 0
+badcommand db 'Bad command entered.', 0x0D, 0x0A, 0
+
+
+buffer times 64 db 0
 times 1024-($-$$) db 0 ; make sure we're taking up 512 bytes for this sector and 1024 bytes total (2 sectors)
